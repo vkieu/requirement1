@@ -44,12 +44,14 @@ public class MainApp extends ParentHBaseDAO {
     private String database;
     private Configuration conf;
     @Autowired
-    private ConsoleProgressBar out;
+    private ConsoleProgressBar cpb;
 
     @Value("${commit.on.delete:false}")
     private boolean commitOnDelete;
     @Value("${number.of.iteration:1}")
     private int numberOfIteration;
+
+    private static long totalRecordsProcessed = 0;
 
     private Configuration getHBaseConf() {
         Configuration conf = HBaseConfiguration.create();
@@ -72,8 +74,11 @@ public class MainApp extends ParentHBaseDAO {
 
         app.conf = conf;
         for(int i = 0; i < app.numberOfIteration; i++) {
-            app.run();
+            if(app.run()) {
+                break;
+            }
         }
+        System.out.println("Total records processed " + totalRecordsProcessed);
     }
 
     private byte[] startRow = null;
@@ -129,9 +134,8 @@ public class MainApp extends ParentHBaseDAO {
     }
 
 
-    private void run() throws Exception {
+    private boolean run() throws Exception {
         long start = System.currentTimeMillis();
-
 
         // Instantiating the Scan class
         Scan scan = new Scan();
@@ -139,13 +143,13 @@ public class MainApp extends ParentHBaseDAO {
         scan.addColumn(DATA_CF, toBytes("f_iid"));
         scan.addColumn(DATA_CF, toBytes("f_paid"));
 
-        byte[] rowMarker = getStartRow();
-        if (rowMarker != null) {
-            out.println("Found marker : " + new String(rowMarker));
+        byte[] startRowMarker = getStartRow();
+        if (startRowMarker != null) {
+            cpb.println("Found marker : " + Bytes.toStringBinary(startRowMarker));
             //restart where marked
-            scan.setStartRow(rowMarker);
+            scan.setStartRow(startRowMarker);
         } else {
-            out.println("No marker found.");
+            cpb.println("No marker found.");
         }
 
         // Instantiating HTable class
@@ -155,45 +159,56 @@ public class MainApp extends ParentHBaseDAO {
         Scan userScan = new Scan();
         userScan.addFamily(DATA_CF);
         HTable userTable = new HTable(conf, database + "_Users");
+        byte[] rowMarker = null;
+        long count = 0;
         try {
             List<Delete> toBeDeleted = new ArrayList<>();
             Result result;
             long recordsAffected = 0;
-            long count = 0;
-            out.println("Start scanning results...");
+
+            cpb.println("Start scanning results...");
             while ((result = scanner.next()) != null) {
-                if (count > numberOfRecordsPerRun) break;
+                totalRecordsProcessed++;
                 count++;
-                out.setStatus(count, "Processing..." + new String(result.getRow()));
+                byte[] currentRow = result.getRow();
+                if (count > numberOfRecordsPerRun) {
+                    break;
+                }
+
+                String scannerRowKey = Bytes.toStringBinary(currentRow);
+                cpb.setStatus(totalRecordsProcessed, "Processing..." + scannerRowKey);
                 byte[] iid = result.getValue(DATA_CF, toBytes("f_iid"));
                 byte[] paid = result.getValue(DATA_CF, toBytes("f_paid"));
-                //out.println(new String(iid) + "+" + new String(paid));
+                //cpb.println(Hex.encodeHexString(paid) + "+" + Hex.encodeHexString(iid));
 
-                byte[] userRowKey = joinBytes(iid, paid);
+                byte[] userRowKey = joinBytes(Bytes.copy(paid, 4, paid.length - 4), iid);
+
                 //get/search the users table
                 Result userResult = userTable.get(new Get(userRowKey));
-                if (userResult == null) {
-                    out.println("User Rowkey '" + new String(userRowKey) + "' Not found");
-                    toBeDeleted.add(new Delete(result.getRow()));
+                if (userResult.getRow() == null) {
+                    System.out.println("==>Registrations rowkey: " +scannerRowKey);
+                    System.out.println("\tf_paid:" + Bytes.toStringBinary(paid) + " ,f_iid:" + Bytes.toStringBinary(iid));
+                    System.out.println("\tSearching Users rowkey   '" + Bytes.toStringBinary(userRowKey) + "' Not found\n");
+                    toBeDeleted.add(new Delete(currentRow));
                     recordsAffected++;
                 }
-                rowMarker = result.getRow();
+                rowMarker = currentRow;
             }
             if(commitOnDelete) {
-                out.println(toBeDeleted.size() + " records deleted!");
+                System.out.println(toBeDeleted.size() + " records deleted!");
                 table.delete(toBeDeleted);
             }
-            out.println("===>>> ElapsedTime in ms: [" + (System.currentTimeMillis() - start) + "] " + recordsAffected);
+            cpb.println("===>>> ElapsedTime in ms: [" + (System.currentTimeMillis() - start) + "] " + recordsAffected);
         } finally {
             if (rowMarker != null) {
                 saveStartRow(rowMarker);
-                out.println("Marker saved #" + new String(rowMarker));
+                cpb.println("Marker saved #" + Bytes.toStringBinary(rowMarker));
             }
         }
 
         table.flushCommits();
         scanner.close();
         table.close();
-
+        return Bytes.equals(startRowMarker, rowMarker);
     }
 }
